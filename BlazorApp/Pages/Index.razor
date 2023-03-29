@@ -1,0 +1,286 @@
+﻿@page "/"
+@using System.Net.Http.Json
+@inject HttpClient Http
+
+@using System.Net.Http
+@using Microsoft.AspNetCore.Components.Forms
+@using Microsoft.AspNetCore.Components.Web
+@using Microsoft.JSInterop
+@using BlazorApp.Shared
+
+@using System;
+@using System.Collections.Generic;
+@using System.Net.Http.Headers;
+@using System.Text;
+@using System.Text.Json;
+@using System.Threading.Tasks;
+
+@using Azure;
+@using Azure.Search.Documents;
+@using Azure.Search.Documents.Models;
+
+@using System.Net;
+
+
+<h3>質問を入力してください</h3>
+<input type="text" @bind="userQuestion" placeholder="質問を入力" style="width: 800px;" />
+<button @onclick="OnAnswerButtonClick">回答を見つける</button>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>Answer</th>
+            <th>Check</th>
+            <th>Reason</th>
+            <th>Score</th>
+            <th>Sample Question</th>
+            <th>Sample Answer</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach (var analyzedResult in analyzedResults)
+        {
+            <tr>
+                <td>@analyzedResult.Answer</td>
+                <td>@analyzedResult.Check</td>
+                <td>@analyzedResult.Reason</td>
+                <td>@analyzedResult.Score</td>
+                <td>@analyzedResult.SearchResult.SampleQuestion</td>
+                <td>@analyzedResult.SearchResult.SampleAnswer</td>
+            </tr>
+        }
+    </tbody>
+</table>
+
+@code {
+
+    private string userQuestion { get; set; } = string.Empty;
+    private List<AnalyzedResult> analyzedResults { get; set; } = new List<AnalyzedResult>();
+
+    private async Task OnAnswerButtonClick()
+    {
+        var keyPhrases = await AnalyzeKeyPhrases(userQuestion);
+        var synonyms = await GenerateSynonyms(keyPhrases);
+        var searchResults = await ExecuteSearch(keyPhrases, synonyms);
+        analyzedResults = (await AnalyzeResults(searchResults, userQuestion)).ToList();
+    }
+
+    public class AnalyzedResult
+    {
+        public string Answer { get; set; }
+        public string Check { get; set; }
+        public string Reason { get; set; }
+        public int Score { get; set; }
+        public SearchResult SearchResult { get; set; }
+    }
+
+    public class SearchResult
+    {
+        public double SearchScore { get; set; }
+        public string ID { get; set; }
+        public string SampleID { get; set; }
+        public string SampleQuestion { get; set; }
+        public string SampleAnswer { get; set; }
+    }
+
+    private async Task<string> CallOpenAIAPI(string systemMessage, string userMessage)
+    {
+        // Azure OpenAI APIのエンドポイントとAPIキーを設定します。
+        var request = new HttpRequestMessage(HttpMethod.Post, "https://***********.openai.azure.com/openai/deployments/************/chat/completions?api-version=2023-03-15-preview");
+        request.Headers.Add("api-key", "***********************");
+
+        request.Content = JsonContent.Create(new
+        {
+            messages = new[]
+            {
+                new { role = "system", content = systemMessage },
+                new { role = "user", content = userMessage }
+    },
+            max_tokens = 4000,
+            temperature = 0.5,
+            frequency_penalty = 0,
+            presence_penalty = 0,
+            top_p = 0.95,
+            stop = (string)null
+        });
+
+        var response = await Http.SendAsync(request);
+        response.EnsureSuccessStatusCode();
+
+        if (response.IsSuccessStatusCode)
+        {
+
+            var resultString = await response.Content.ReadAsStringAsync();
+            var result = JsonSerializer.Deserialize<OpenAIResult>(resultString);
+            return result.choices[0].message.content;
+
+        }
+        else
+        {
+            throw new Exception("Failed to call OpenAI API.");
+        }
+    }
+
+    public class OpenAIResult
+    {
+        public List<Choice> choices { get; set; }
+    }
+
+    public class Choice
+    {
+        public Message message { get; set; }
+    }
+
+    public class Message
+    {
+        public string content { get; set; }
+    }
+
+    private async Task<IEnumerable<string>> AnalyzeKeyPhrases(string question)
+    {
+        string systemMessage = @"
+次の文章をキーフレーズ分析して下さい。
+キーフレーズ分析の結果は、フォーマットに記載された形式で出力して下さい。
+キーフレーズのみ出力して下さい。
+改行コードは入れないで下さい。
+
+Desired format:
+key phrase:キーフレーズ
+";
+
+        var responseMessage = await CallOpenAIAPI(systemMessage, question);
+        var keyPhrasesString = responseMessage.Replace("key phrase:", "").Trim();
+        var keyPhrases = keyPhrasesString.Split('\n').Select(phrase => phrase.Trim()).ToList();
+        return keyPhrases;
+    }
+
+    private async Task<IEnumerable<string>> GenerateSynonyms(IEnumerable<string> keyPhrases)
+    {
+        string systemMessage = @"
+次の文章の言葉の同義語を３つずつ教えて下さい。
+同義語は一行にまとめて、フォーマットに記載された形式で出力して下さい。
+同義語のみ出力して下さい。
+改行コードは入れないで下さい。
+段階的に、論理的に考えて下さい。
+
+Desired format:
+Synonym:同義語
+";
+
+        List<string> synonyms2 = new List<string>();
+
+        foreach (string keyPhrase in keyPhrases)
+        {
+
+            var responseMessage = await CallOpenAIAPI(systemMessage, keyPhrase);
+            var synonymsString = responseMessage.Replace("Synonym:", "").Trim();
+            var synonyms = synonymsString.Split(',').Select(synonym => synonym.Trim()).ToList();
+
+            synonyms2.AddRange(synonyms);
+
+        }
+
+        return synonyms2;
+    }
+
+    private async Task<IEnumerable<SearchResult>> ExecuteSearch(IEnumerable<string> keyPhrases, IEnumerable<string> synonyms)
+    {
+        // Azure Cognitive SearchのAPIキーとエンドポイントを設定します。
+        string searchApiKey = "****************************************************";
+        Uri searchEndpoint = new Uri("https://*********************.search.windows.net");
+
+        // 検索クエリを作成します。
+        string searchQuery = string.Join(" OR ", keyPhrases) + " OR " + string.Join(" OR ", synonyms);
+
+        // SearchClient インスタンスを作成します。
+        // Azure Cognitive Searchのエンドポイント、インデックス名、APIキーを設定します。
+        SearchClient searchClient = new SearchClient(searchEndpoint, "********", new AzureKeyCredential(searchApiKey));
+
+        // 検索オプションを設定します。
+        var searchOptions = new SearchOptions
+            {
+                Filter = null,
+                Size = 5
+            };
+
+        // 検索を実行し、結果を取得します。
+        Response<SearchResults<SearchDocument>> response = await searchClient.SearchAsync<SearchDocument>(searchQuery, searchOptions);
+
+        List<SearchResult> searchResults = new List<SearchResult>();
+
+        // 応答を解析し、SearchResultオブジェクトのリストに変換します。
+        if (response.GetRawResponse().Status == (int)HttpStatusCode.OK)
+        {
+            //foreach (SearchResult result in response.Value.GetResults())
+            foreach (Azure.Search.Documents.Models.SearchResult<SearchDocument> result in response.Value.GetResults())
+            {
+                SearchResult searchResult = new SearchResult
+                    {
+                        SearchScore = result.Score.HasValue ? result.Score.Value : 0.0,
+                        ID = result.Document["ID"].ToString(),
+                        SampleID = result.Document["SampleID"].ToString(),
+                        SampleQuestion = result.Document["SampleQuestion"].ToString(),
+                        SampleAnswer = result.Document["SampleAnswer"].ToString()
+                    };
+
+                searchResults.Add(searchResult);
+            }
+
+            return searchResults;
+        }
+        else
+        {
+            throw new Exception("Failed to execute search.");
+        }
+    }
+
+    // 以下に、AnalyzeKeyPhrases関数、GenerateSynonyms関数、
+    // ExecuteSearch関数、AnalyzeResults関数、CallOpenAIAPI関数を配置します。
+    private async Task<IEnumerable<AnalyzedResult>> AnalyzeResults(IEnumerable<SearchResult> searchResults, string userQuestion)
+    {
+        List<AnalyzedResult> analyzedResults = new List<AnalyzedResult>();
+
+        foreach (var searchResult in searchResults)
+        {
+            string systemMessage = $@"あなたはFAQチャットボットです。
+次の文章を読んで、質問に答えて下さい。
+文章が質問への回答として正解であればY、正解でなければNをanswerに出力して下さい。
+文章が質問への回答として適切な内容であればOK、適切な内容でなければNGをcheckに出力して下さい。
+質問にはOK、NG、Y、Nしか回答できません。
+回答と信頼性スコアはフォーマットに記載された形式で出力して下さい。
+信頼性スコアは整数のみ出力して下さい。
+段階的に、論理的に考えて下さい。
+
+Desired format:
+answer:{{Y or N}}
+check:{{OK or NG}}
+reason:回答
+score:信頼性スコア
+
+文章:
+{searchResult.SampleAnswer}";
+
+            string userMessage = $@"質問:
+{userQuestion}";
+
+            string response = await CallOpenAIAPI(systemMessage, userMessage);
+
+
+            string[] responseParts = response.Split('\n').Select(line => line.Split(':')[1]).ToArray();
+
+            AnalyzedResult analyzedResult = new AnalyzedResult
+                {
+                    Answer = responseParts[0].Trim(),
+                    Check = responseParts[1].Trim(),
+                    Reason = responseParts[2].Trim(),
+                    Score = int.Parse(responseParts[3].Trim()),
+                    SearchResult = searchResult
+                };
+
+            analyzedResults.Add(analyzedResult);
+        }
+
+        return analyzedResults;
+    }
+
+}
